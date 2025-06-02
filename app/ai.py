@@ -186,3 +186,78 @@ def recommend_bundles():
         })
 
     return jsonify(result), 200
+
+
+# Based on user query
+@ai_bp.route("/query/recommend", methods=["POST"])
+def recommend_from_query():
+    data = request.get_json()
+    query = data.get("query", "").strip()
+
+    if not query:
+        return jsonify({"error": "Missing 'query' in JSON body"}), 400
+
+    try:
+        query_embedding = embedding_model.encode(query, convert_to_tensor=True)
+        similarities = []
+
+        for doc in collection.find({}, {"slug": 1, "tags": 1}):
+            tags = doc.get("tags", [])
+            if not tags:
+                continue
+            tags_text = " ".join(tags)
+            doc_embedding = embedding_model.encode(tags_text, convert_to_tensor=True)
+            sim_score = util.cos_sim(query_embedding, doc_embedding).item()
+            similarities.append((doc['slug'], sim_score))
+
+        top_k = sorted(similarities, key=lambda x: x[1], reverse=True)[:5]
+        return jsonify({"recommended_slugs": [slug for slug, _ in top_k]}), 200
+
+    except Exception as e:
+        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+
+@ai_bp.route("/query/bundling", methods=["POST"])
+def bundle_from_query():
+    data = request.get_json()
+    query = data.get("query", "").strip()
+
+    if not query:
+        return jsonify({"error": "Missing 'query' in JSON body"}), 400
+
+    try:
+        query_embedding = embedding_model.encode(query, convert_to_tensor=True)
+        best_matches = {}
+
+        for doc in collection.find():
+            raw_category = doc.get("category", "")
+            canonical_category = detect_category(raw_category)
+            if not canonical_category:
+                continue
+
+            tags = doc.get("tags", [])
+            if not tags:
+                continue
+
+            doc_embedding = embedding_model.encode(" ".join(tags), convert_to_tensor=True)
+            score = util.cos_sim(query_embedding, doc_embedding).item()
+
+            if canonical_category not in best_matches or score > best_matches[canonical_category][1]:
+                best_matches[canonical_category] = (doc, score)
+
+        response = {
+            "query": query,
+            "recommendations": [
+                {
+                    "category": cat,
+                    "slug": rec.get("slug"),
+                    "tags": rec.get("tags"),
+                    "score": round(score, 4)
+                }
+                for cat, (rec, score) in best_matches.items()
+            ]
+        }
+
+        return jsonify(response), 200
+
+    except Exception as e:
+        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
