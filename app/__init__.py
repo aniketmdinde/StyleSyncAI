@@ -1,10 +1,13 @@
 from flask import Flask
 import os
 import google.generativeai as genai
-import io
+from pymongo import MongoClient
+import urllib.parse
+from sentence_transformers import SentenceTransformer, util
+import torch
 
 genai.configure(api_key="AIzaSyD6NSWFspgQgBOHt2F08VZStEvc37xMBZ4")
-model = genai.GenerativeModel("gemini-2.5-flash-preview-05-20")
+gemini_model = genai.GenerativeModel("gemini-2.5-flash-preview-05-20")
 system_prompt = """
 You are a fashion enrichment and analysis assistant for a fashion recommendation engine.
 
@@ -32,6 +35,18 @@ Analyze the text and/or image and return a single structured JSON object with:
   - `semantic_category`: "",
   - `categories`: []
 """
+
+username = "aniketmdinde100"
+raw_password = "Aniket*99"
+encoded_password = urllib.parse.quote_plus(raw_password)
+
+uri = f"mongodb+srv://{username}:{encoded_password}@stylesyncaicluster.jr7xedc.mongodb.net/stylesync?retryWrites=true&w=majority&appName=StyleSyncAICluster"
+client = MongoClient(uri)
+db = client["stylesync"]
+collection = db["products"]
+
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
 
 def create_app():
     app = Flask(__name__)
