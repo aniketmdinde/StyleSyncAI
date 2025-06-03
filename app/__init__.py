@@ -53,6 +53,6 @@ def create_app():
     app.config['SECRET_KEY'] = "123"
 
     from .ai import ai_bp
-    app.register_blueprint(ai_bp, url_prefix='/api')
+    app.register_blueprint(ai_bp, url_prefix='')
 
     return app
