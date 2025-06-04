@@ -1,263 +1,203 @@
 from flask import Blueprint, jsonify, request
-from . import gemini_model, embedding_model, system_prompt, collection
-from sentence_transformers import util
+from app import collection
 from PIL import Image
+import io
+from .outfit_transformer import outfit_recommender
+import logging
+from itertools import product, combinations
 
-ai_bp = Blueprint("audio", __name__)
+# Major categories and their semantic subcategories (removed bag, activewear, intimates)
+MAJOR_CATEGORY_MAP = {
+    "top": ["blouse", "shirt", "t-shirt", "sweater", "cardigan", "jacket", "vest", "tank top", "polo", "hoodie", "tunic", "outerwear", "sweatshirt"],
+    "bottom": ["jeans", "pants", "skirt", "shorts", "leggings", "trousers", "suit", "jumpsuit", "romper", "capri", "cropped pants"],
+    "dress": ["dress", "gown", "wedding dress", "day dress", "cocktail dress"],
+    "shoes": ["boots", "pumps", "sandals", "flats", "flip flops", "sneakers", "slippers", "loafers", "moccasins", "oxfords", "clogs", "athletic shoes"],
+    "outerwear": ["coat", "jacket", "vest", "blazer"],
+    "accessories": ["belt", "glove", "hat", "tie", "sunglasses", "hair accessory", "umbrella", "scarf", "watch", "jewelry", "necklace", "earring", "ring", "brooch", "hosiery", "sock"],
+}
+
+# Color harmony (simplified): analogous, monochromatic, or same family
+COLOR_GROUPS = [
+    {"white", "grey", "black", "navy", "brown"},
+    {"red", "pink", "magenta", "purple"},
+    {"blue", "cyan", "turquoise", "azure"},
+    {"green", "olive", "emerald", "mint", "sage"},
+    {"yellow", "gold", "beige", "cream"},
+    {"orange", "peach", "apricot", "tan"},
+]
+
+def color_group(color):
+    color = color.lower()
+    for group in COLOR_GROUPS:
+        if color in group:
+            return group
+    return {color}
+
+# Flatten all semantic subcategories for quick lookup
+SEMANTIC_TO_MAJOR = {}
+for major, semantics in MAJOR_CATEGORY_MAP.items():
+    for sem in semantics:
+        SEMANTIC_TO_MAJOR[sem] = major
+
+def get_major_and_semantic_category(product):
+    tags = [t.lower() for t in product.get("tags", [])]
+    cat = product.get("category", "").lower()
+    for tag in tags + [cat]:
+        for sem, major in SEMANTIC_TO_MAJOR.items():
+            if sem in tag or tag in sem:
+                return major, sem
+    if cat in MAJOR_CATEGORY_MAP:
+        return cat, cat
+    return "other", cat
+
+ai_bp = Blueprint("ai", __name__)
+MAJOR_CATEGORIES = list(MAJOR_CATEGORY_MAP.keys())
+
+# Helper: check if two items are compatible by gender and season
+def compatible_items(item1, item2):
+    return (
+        (item1.get("gender", "unisex") == item2.get("gender", "unisex") or "unisex" in [item1.get("gender"), item2.get("gender")]) and
+        (item1.get("season", "all") == item2.get("season", "all") or "all" in [item1.get("season"), item2.get("season")])
+    )
+
+# Helper: check color harmony for a bundle
+def harmonious_colors(bundle):
+    colors = [item.get("color", "") for item in bundle]
+    groups = [color_group(c) for c in colors if c]
+    # All colors should be in at most 2 groups (analogous/monochrome)
+    unique_groups = set(tuple(sorted(g)) for g in groups)
+    return len(unique_groups) <= 2
+
+# Helper: ensure bundles are diverse (at least 3 different items between bundles)
+def bundles_are_diverse(bundle1, bundle2):
+    slugs1 = set(item["slug"] for item in bundle1)
+    slugs2 = set(item["slug"] for item in bundle2)
+    return len(slugs1.symmetric_difference(slugs2)) >= 3
+
+# Main function to generate top N diverse, harmonious bundles
+def generate_bundles(recommendations, n=3):
+    # Group by major category and pick top 3 for each
+    category_items = {cat: [] for cat in MAJOR_CATEGORIES}
+    for rec in recommendations:
+        major, semantic = get_major_and_semantic_category(rec)
+        if major in MAJOR_CATEGORIES:
+            rec['major_category'] = major
+            rec['semantic_category'] = semantic
+            if len(category_items[major]) < 3:
+                category_items[major].append(rec)
+    # Only use one item per category in each bundle
+    bundle_candidates = [category_items[cat] for cat in MAJOR_CATEGORIES if category_items[cat]]
+    if len(bundle_candidates) < 2:
+        return []
+    all_bundles = [list(bundle) for bundle in product(*bundle_candidates)]
+    # Filter for unique categories in each bundle (should always be true, but double check)
+    valid_bundles = []
+    for bundle in all_bundles:
+        majors = [item['major_category'] for item in bundle]
+        if len(set(majors)) != len(majors):
+            continue  # skip bundles with duplicate categories
+        # All items must be compatible by gender/season
+        if not all(compatible_items(bundle[i], bundle[j]) for i, j in combinations(range(len(bundle)), 2)):
+            continue
+        # Color harmony
+        if not harmonious_colors(bundle):
+            continue
+        valid_bundles.append(bundle)
+    # Sort by average compatibility score
+    valid_bundles.sort(key=lambda b: sum(item['compatibility_score'] for item in b) / len(b), reverse=True)
+    # Ensure diversity: pick top N bundles with at least 3 different items between them
+    diverse_bundles = []
+    for bundle in valid_bundles:
+        if all(bundles_are_diverse(bundle, prev) for prev in diverse_bundles):
+            diverse_bundles.append(bundle)
+        if len(diverse_bundles) == n:
+            break
+    # If not enough, fill with best available
+    while len(diverse_bundles) < n and valid_bundles:
+        candidate = valid_bundles.pop(0)
+        if candidate not in diverse_bundles:
+            diverse_bundles.append(candidate)
+    return [
+        {
+            "items": b,
+            "score": round(sum(item['compatibility_score'] for item in b) / len(b), 4)
+        } for b in diverse_bundles
+    ]
 
 @ai_bp.route('/')
 def home():
     return jsonify({"response": "Hello"}), 200
 
-@ai_bp.route("/ai", methods=["GET", "POST"])
-def index():
-    if request.method == "POST":
-        query = request.form.get("query", "").strip()
-        image_file = request.files.get("image")
-
-        if not query and not image_file:
-            return jsonify({"error": "Please provide a description or image."}), 400
-
-        try:
-            inputs = [system_prompt]
-            if query:
-                inputs.append("User Query:\n" + query)
-
-            if image_file:
-                image = Image.open(image_file.stream)
-                inputs.append(image)
-
-            response = gemini_model.generate_content(inputs, stream=False)
-            return jsonify({"result": response.text}), 200
-
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
-    return jsonify({"message": "Send a POST request with a 'query' or an 'image'."}), 200
-
-
-@ai_bp.route("/add", methods=["POST"])
-def add_data():
-    try:
-        data = request.get_json()
-
-        if not data:
-            return jsonify({"error": "No JSON data received"}), 400
-        
-        result = collection.insert_one(data)
-        return jsonify({
-            "message": "Data inserted successfully!",
-            "inserted_id": str(result.inserted_id)
-        }), 201
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    
-@ai_bp.route("/example", methods=["POST"])
-def example():
-    return jsonify({"message": "true"}), 200
-
-
-# Recommendation
-def get_product_tags(slug):
-    product = collection.find_one({"slug": slug})
-    if product and 'tags' in product:
-        return product['tags']
-    else:
-        raise ValueError("Product with given slug not found or no tags.")
-
-def get_all_products_except(slug):
-    products = list(collection.find({"slug": {"$ne": slug}}, {"slug": 1, "tags": 1}))
-    return products
-
-def recommend_similar_products(slug, top_k=3):
-    base_tags = get_product_tags(slug)
-    base_text = " ".join(base_tags)
-    base_embedding = embedding_model.encode(base_text, convert_to_tensor=True)
-
-    candidates = get_all_products_except(slug)
-    similarities = []
-
-    for prod in candidates:
-        prod_tags = prod.get('tags', [])
-        if not prod_tags:
-            continue
-        prod_text = " ".join(prod_tags)
-        prod_embedding = embedding_model.encode(prod_text, convert_to_tensor=True)
-        sim_score = util.cos_sim(base_embedding, prod_embedding).item()
-        similarities.append((prod['slug'], sim_score))
-
-    top_matches = sorted(similarities, key=lambda x: x[1], reverse=True)[:top_k]
-    return [slug for slug, score in top_matches]
-
-@ai_bp.route('/recommend', methods=['POST'])
+@ai_bp.route("/recommend", methods=["POST"])
 def recommend():
     data = request.get_json()
-    if not data or 'slug' not in data:
-        return jsonify({"error": "Missing 'slug' in JSON body"}), 400
-
-    slug = data['slug']
-
+    if not data or 'query' not in data:
+        return jsonify({"error": "Missing 'query' in JSON body"}), 400
+    query = data['query']
     try:
-        top_slugs = recommend_similar_products(slug)
-        return jsonify({"recommended_slugs": top_slugs})
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 404
+        recommendations = outfit_recommender.get_outfit_recommendations(query, top_k=50)
+        bundles = generate_bundles(recommendations, n=3)
+        if not bundles:
+            return jsonify({"error": "No valid outfits found for the query."}), 404
+        return jsonify({
+            "query": query,
+            "outfits": bundles
+        })
     except Exception as e:
-        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+        logging.exception("Error in /recommend endpoint")
+        return jsonify({"error": str(e)}), 500
     
-
-# Outfit Bundling
-category_map = { 
-    'top': ['top', 'shirt'],
-    'bottom': ['bottom', 'pant', 'skirt', 'short'],
-    'accessories': ['accessories'],
-    'shoes': ['shoes', 'sandals', 'slippers']
-}
-
-def detect_category(category_name):
-    category_name = category_name.lower()
-    for canonical, keywords in category_map.items():
-        if any(keyword in category_name for keyword in keywords):
-            return canonical
-    return None
-
-def get_product_by_slug(slug):
-    doc = collection.find_one({"slug": slug})
-    if doc:
-        tags = doc.get("tags", [])
-        raw_category = doc.get("category", "")
-        canonical_category = detect_category(raw_category)
-        return {"tags": tags, "category": canonical_category}
-    return None
-
-def find_best_bundles(target_tags, exclude_category):
-    best_matches = {}
-    target_embedding = embedding_model.encode(" ".join(target_tags), convert_to_tensor=True)
-
-    for doc in collection.find():
-        doc_category_raw = doc.get("category", "")
-        doc_category = detect_category(doc_category_raw)
-
-        if not doc_category or doc_category == exclude_category:
-            continue
-
-        tags = doc.get("tags", [])
-        if not tags:
-            continue
-
-        doc_embedding = embedding_model.encode(" ".join(tags), convert_to_tensor=True)
-        score = util.cos_sim(target_embedding, doc_embedding).item()
-
-        if doc_category not in best_matches or score > best_matches[doc_category][1]:
-            best_matches[doc_category] = (doc, score)
-
-    return best_matches
+@ai_bp.route("/recommend/image", methods=["POST"])
+def recommend_from_image():
+    if 'image' not in request.files:
+        return jsonify({"error": "No image file provided"}), 400
+    try:
+        image_file = request.files['image']
+        image = Image.open(io.BytesIO(image_file.read()))
+        recommendations = outfit_recommender.get_outfit_recommendations(image, is_image=True, top_k=50)
+        bundles = generate_bundles(recommendations, n=3)
+        if not bundles:
+            return jsonify({"error": "No valid outfits found for the image."}), 404
+        return jsonify({
+            "outfits": bundles
+        })
+    except Exception as e:
+        logging.exception("Error in /recommend/image endpoint")
+        return jsonify({"error": str(e)}), 500
 
 @ai_bp.route("/bundling", methods=["POST"])
 def recommend_bundles():
     data = request.get_json()
-    slug = data.get("slug")
-
-    if not slug:
-        return jsonify({"error": "Missing 'slug' in request body"}), 400
-
-    product = get_product_by_slug(slug)
-    if not product:
-        return jsonify({"error": "Product not found"}), 404
-
-    recommendations = find_best_bundles(product["tags"], product["category"])
-
-    result = {
-        "target_product": {
-            "slug": slug,
-            "category": product["category"],
-            "tags": product["tags"]
-        },
-        "recommendations": []
-    }
-
-    for cat, (rec, score) in recommendations.items():
-        result["recommendations"].append({
-            "category": cat,
-            "slug": rec.get("slug"),
-            "tags": rec.get("tags"),
-            "score": round(score, 4)
-        })
-
-    return jsonify(result), 200
-
-
-# Based on user query
-@ai_bp.route("/query/recommend", methods=["POST"])
-def recommend_from_query():
-    data = request.get_json()
-    query = data.get("query", "").strip()
-
-    if not query:
+    if not data or 'query' not in data:
         return jsonify({"error": "Missing 'query' in JSON body"}), 400
-
+    query = data['query']
     try:
-        query_embedding = embedding_model.encode(query, convert_to_tensor=True)
-        similarities = []
-
-        for doc in collection.find({}, {"slug": 1, "tags": 1}):
-            tags = doc.get("tags", [])
-            if not tags:
-                continue
-            tags_text = " ".join(tags)
-            doc_embedding = embedding_model.encode(tags_text, convert_to_tensor=True)
-            sim_score = util.cos_sim(query_embedding, doc_embedding).item()
-            similarities.append((doc['slug'], sim_score))
-
-        top_k = sorted(similarities, key=lambda x: x[1], reverse=True)[:5]
-        return jsonify({"recommended_slugs": [slug for slug, _ in top_k]}), 200
-
-    except Exception as e:
-        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
-
-@ai_bp.route("/query/bundling", methods=["POST"])
-def bundle_from_query():
-    data = request.get_json()
-    query = data.get("query", "").strip()
-
-    if not query:
-        return jsonify({"error": "Missing 'query' in JSON body"}), 400
-
-    try:
-        query_embedding = embedding_model.encode(query, convert_to_tensor=True)
-        best_matches = {}
-
-        for doc in collection.find():
-            raw_category = doc.get("category", "")
-            canonical_category = detect_category(raw_category)
-            if not canonical_category:
-                continue
-
-            tags = doc.get("tags", [])
-            if not tags:
-                continue
-
-            doc_embedding = embedding_model.encode(" ".join(tags), convert_to_tensor=True)
-            score = util.cos_sim(query_embedding, doc_embedding).item()
-
-            if canonical_category not in best_matches or score > best_matches[canonical_category][1]:
-                best_matches[canonical_category] = (doc, score)
-
-        response = {
+        recommendations = outfit_recommender.get_outfit_recommendations(query, top_k=50)
+        bundles = generate_bundles(recommendations, n=3)
+        if not bundles:
+            return jsonify({"error": "No valid bundles could be created."}), 404
+        return jsonify({
             "query": query,
-            "recommendations": [
-                {
-                    "category": cat,
-                    "slug": rec.get("slug"),
-                    "tags": rec.get("tags"),
-                    "score": round(score, 4)
-                }
-                for cat, (rec, score) in best_matches.items()
-            ]
-        }
-
-        return jsonify(response), 200
-
+            "bundles": bundles
+        })
     except Exception as e:
-        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+        logging.exception("Error in /bundling endpoint")
+        return jsonify({"error": str(e)}), 500
+
+@ai_bp.route("/bundling/image", methods=["POST"])
+def bundle_from_image():
+    if 'image' not in request.files:
+        return jsonify({"error": "No image file provided"}), 400
+    try:
+        image_file = request.files['image']
+        image = Image.open(io.BytesIO(image_file.read()))
+        recommendations = outfit_recommender.get_outfit_recommendations(image, is_image=True, top_k=50)
+        bundles = generate_bundles(recommendations, n=3)
+        if not bundles:
+            return jsonify({"error": "No valid bundles could be created."}), 404
+        return jsonify({
+            "bundles": bundles
+        })
+    except Exception as e:
+        logging.exception("Error in /bundling/image endpoint")
+        return jsonify({"error": str(e)}), 500
